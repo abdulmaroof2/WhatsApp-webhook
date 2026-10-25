@@ -131,6 +131,164 @@ def health():
     })
 
 
+
+# ---------------------------------------------------------------------------
+# Vapi lead email notification (FlowPilot AI sales agent)
+# ---------------------------------------------------------------------------
+# The Vapi assistant posts its end-of-call report here. Set the assistant's
+# Server URL in Vapi to https://maroof25.pythonanywhere.com/vapi-lead and
+# every finished call will arrive as a POST with the call transcript and
+# summary. We extract the lead details and email them to Abdul.
+#
+# Email uses Gmail SMTP. Set these in the PythonAnywhere WSGI file
+# (os.environ), never in this file:
+#   LEAD_GMAIL_USER          Gmail address that sends the mail
+#   LEAD_GMAIL_APP_PASSWORD  Gmail App Password (NOT the normal password:
+#                            Google Account -> Security -> 2-Step Verification
+#                            -> App passwords)
+#   LEAD_NOTIFY_TO           Where the lead mail goes
+#                            (default: LEAD_GMAIL_USER)
+#   LEAD_WEBHOOK_SECRET      Optional: if set, requests must carry
+#                            ?secret=<value> or header X-Lead-Secret.
+# If email is not configured, leads are still logged to vapi_leads.jsonl
+# and the endpoint returns ok (never break Vapi's delivery).
+
+import smtplib
+from email.message import EmailMessage
+
+LEAD_GMAIL_USER = os.environ.get("LEAD_GMAIL_USER", "")
+LEAD_GMAIL_APP_PASSWORD = os.environ.get("LEAD_GMAIL_APP_PASSWORD", "")
+LEAD_NOTIFY_TO = os.environ.get("LEAD_NOTIFY_TO", "") or LEAD_GMAIL_USER
+LEAD_WEBHOOK_SECRET = os.environ.get("LEAD_WEBHOOK_SECRET", "")
+LEAD_LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vapi_leads.jsonl")
+
+
+def _extract_lead(data):
+    """Pull lead details out of a Vapi server message. Returns {} if the
+    message carries no lead (e.g. a conversation-update)."""
+    msg = data.get("message", {}) if isinstance(data, dict) else {}
+    mtype = msg.get("type", "")
+    lead = {}
+
+    if mtype == "end-of-call-report":
+        call = msg.get("call", {}) or {}
+        customer = call.get("customer", {}) or {}
+        lead["kind"] = "end-of-call-report"
+        lead["caller"] = customer.get("number", "")
+        lead["call_id"] = call.get("id", "")
+        lead["started"] = msg.get("startedAt", "")
+        lead["ended"] = msg.get("endedAt", "")
+        lead["summary"] = msg.get("summary", "") or (
+            msg.get("analysis", {}) or {}).get("summary", "")
+        analysis = msg.get("analysis", {}) or {}
+        structured = analysis.get("structuredData", {}) or {}
+        if isinstance(structured, dict):
+            lead.update({k: v for k, v in structured.items()
+                         if isinstance(v, (str, int, float))})
+        transcript = msg.get("transcript", "") or ""
+        lead["transcript"] = transcript[-4000:] if transcript else ""
+        return lead
+
+    if mtype == "tool-calls":
+        params = {}
+        for tc in msg.get("toolCallList", []) or []:
+            fn = tc.get("function", {}) or {}
+            try:
+                args = json.loads(fn.get("arguments", "{}") or "{}")
+            except Exception:
+                args = {}
+            if isinstance(args, dict):
+                params.update(args)
+        if params:
+            lead["kind"] = "tool-call"
+            lead["caller"] = params.get("phone") or params.get("caller") or ""
+            lead.update({k: v for k, v in params.items()
+                         if isinstance(v, (str, int, float))})
+            return lead
+
+    return {}
+
+
+def _log_lead(lead):
+    try:
+        with open(LEAD_LOG_FILE, "a") as f:
+            f.write(json.dumps(lead) + "\n")
+    except Exception:
+        log.exception("Could not write lead log")
+
+
+def _send_lead_email(lead):
+    """Send the lead by Gmail SMTP. Returns (sent, error)."""
+    if not (LEAD_GMAIL_USER and LEAD_GMAIL_APP_PASSWORD and LEAD_NOTIFY_TO):
+        return False, "email not configured"
+    lines = ["New FlowPilot AI lead", ""]
+    lines.append("Time: " + (lead.get("ended") or lead.get("started") or ""))
+    if lead.get("caller"):
+        lines.append("Caller number: " + str(lead["caller"]))
+    for key in ("name", "business", "business_name", "phone", "notes"):
+        if lead.get(key):
+            lines.append(key.replace("_", " ").title() + ": " + str(lead[key]))
+    if lead.get("summary"):
+        lines.append("")
+        lines.append("Summary:")
+        lines.append(str(lead["summary"]))
+    if lead.get("transcript"):
+        lines.append("")
+        lines.append("Transcript (tail):")
+        lines.append(str(lead["transcript"]))
+    lines.append("")
+    lines.append("Next step: contact this lead on WhatsApp (0329 0302088) "
+                 "to set up their FREE plan.")
+    body = "\n".join(lines)
+
+    msg = EmailMessage()
+    msg["Subject"] = "New FlowPilot AI lead: " + str(
+        lead.get("business") or lead.get("business_name")
+        or lead.get("name") or lead.get("caller") or "unknown")
+    msg["From"] = LEAD_GMAIL_USER
+    msg["To"] = LEAD_NOTIFY_TO
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+            s.starttls()
+            s.login(LEAD_GMAIL_USER, LEAD_GMAIL_APP_PASSWORD)
+            s.send_message(msg)
+        return True, ""
+    except Exception as e:
+        log.exception("Lead email failed")
+        return False, str(e)[:200]
+
+
+@app.route("/vapi-lead", methods=["POST"])
+def vapi_lead():
+    """Receive a Vapi call report and email the lead to Abdul."""
+    if LEAD_WEBHOOK_SECRET:
+        provided = (request.args.get("secret", "")
+                    or request.headers.get("X-Lead-Secret", ""))
+        if provided != LEAD_WEBHOOK_SECRET:
+            return jsonify({"status": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    lead = _extract_lead(data)
+    if not lead:
+        return jsonify({"status": "ignored"}), 200
+    _log_lead(lead)
+    sent, err = _send_lead_email(lead)
+    log.info("Vapi lead: caller=%s email_sent=%s err=%s",
+             lead.get("caller"), sent, err)
+    return jsonify({"status": "ok", "email_sent": sent}), 200
+
+
+@app.route("/vapi-lead/health", methods=["GET"])
+def vapi_lead_health():
+    return jsonify({
+        "status": "ok",
+        "email_configured": bool(
+            LEAD_GMAIL_USER and LEAD_GMAIL_APP_PASSWORD and LEAD_NOTIFY_TO),
+        "notify_to_set": bool(LEAD_NOTIFY_TO),
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info("Starting WhatsApp webhook on port %s", port)
